@@ -1,2 +1,4 @@
-worker: python bot_full.py
-web: gunicorn api:app
+python-telegram-bot==20.6
+psycopg2-binary
+Flask
+gunicorn
