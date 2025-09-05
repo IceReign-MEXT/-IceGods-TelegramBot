@@ -1,99 +1,77 @@
 import os
-import logging
-import psycopg2
-from datetime import datetime, timedelta
+import requests
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from db import init_db, add_invoice, get_conn, mark_invoice_paid
 
-# Env
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_URL = os.getenv("DATABASE_URL")
+# Load env vars
+load_dotenv()
 
-# Plans
-PLANS = {
-    "starter": {"price": 10, "days": 7},
-    "pro": {"price": 30, "days": 30},
-    "godmode": {"price": 200, "days": 9999},  # lifetime
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OWNER_ID = int(os.getenv("TELEGRAM_OWNER_ID"))
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+
+# Updated prices 💰
+PRICES = {
+    "plan_1h": 5,
+    "plan_4h": 15,
+    "plan_8h": 25,
+    "plan_12h": 40,
+    "plan_24h": 70,
+    "plan_week": 300,
+    "plan_month": 1000,
+    "plan_year": 8000
 }
 
-# Connect DB
-def get_db():
-    return psycopg2.connect(DB_URL)
+PAYMENT_WALLET_SOL = os.getenv("PAYMENT_WALLET_SOL")
+PAYMENT_WALLET_ETH = os.getenv("PAYMENT_WALLET_ETH")
 
-# Create tables if not exist
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS wolfguard_users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE,
-        wallet TEXT,
-        plan TEXT,
-        expiry TIMESTAMP
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS invoices (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT,
-        plan TEXT,
-        amount INT,
-        paid BOOLEAN DEFAULT FALSE,
-        created TIMESTAMP DEFAULT NOW()
-    );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+init_db()
 
-# Commands
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context):
+    await update.message.reply_text("👋 Welcome to IceGods Watcher!\nUse /plans to view subscription options.")
+
+async def plans(update: Update, context):
     keyboard = [
-        [InlineKeyboardButton("Starter - $10 (7 days)", callback_data="starter")],
-        [InlineKeyboardButton("Pro - $30 (30 days)", callback_data="pro")],
-        [InlineKeyboardButton("God Mode - $200 (Lifetime)", callback_data="godmode")]
+        [InlineKeyboardButton("1h - $5", callback_data="plan_1h"),
+         InlineKeyboardButton("4h - $15", callback_data="plan_4h")],
+        [InlineKeyboardButton("1d - $70", callback_data="plan_24h"),
+         InlineKeyboardButton("1w - $300", callback_data="plan_week")],
+        [InlineKeyboardButton("1m - $1000", callback_data="plan_month"),
+         InlineKeyboardButton("1y - $8000", callback_data="plan_year")]
     ]
-    await update.message.reply_text(
-        "👋 Welcome to IceGods Bot!\nChoose your plan:", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await update.message.reply_text("📌 Choose a plan:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    plan = query.data
-    amount = PLANS[plan]["price"]
+async def plan_button(update: Update, context):
+    q = update.callback_query
+    await q.answer()
+    plan = q.data
+    price = PRICES.get(plan)
 
-    # Save invoice
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO invoices (telegram_id, plan, amount) VALUES (%s,%s,%s) RETURNING id",
-        (query.from_user.id, plan, amount)
-    )
-    invoice_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
+    payload = {"tg_id": update.effective_user.id, "plan": plan, "price": price}
+    r = requests.post(f"{API_BASE}/api/create_invoice", json=payload)
 
-    await query.edit_message_text(
-        text=f"💳 Pay ${amount} for {plan.title()}.\n"
-             f"Send crypto to wallet:\n\n"
-             f"`{os.getenv('WALLET_ADDRESS')}`\n\n"
-             f"Then wait for confirmation (Invoice #{invoice_id}).",
-        parse_mode="Markdown"
-    )
+    if r.status_code == 200:
+        inv = r.json()
+        msg = f"💸 Pay ${price} in USDC (Solana) to:\n\n`{PAYMENT_WALLET_SOL}`\n\nInvoice ID: {inv['id']}"
+        await q.edit_message_text(msg, parse_mode="Markdown")
+    else:
+        await q.edit_message_text("❌ Failed to create invoice.")
+
+async def sweep_cmd(update: Update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Not authorized.")
+        return
+    await update.message.reply_text("🧹 Sweep triggered!")
 
 def main():
-    init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(CommandHandler("plans", plans))
+    app.add_handler(CallbackQueryHandler(plan_button))
+    app.add_handler(CommandHandler("sweep", sweep_cmd))
     app.run_polling()
 
 if __name__ == "__main__":
