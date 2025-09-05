@@ -1,7 +1,3 @@
-from db import init_db
-
-init_db()  # ✅ auto-run migrations
-
 import os
 import requests
 from dotenv import load_dotenv
